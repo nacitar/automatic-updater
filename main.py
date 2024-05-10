@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 import urllib.request
 from contextlib import ExitStack
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum, auto, unique
 from os.path import commonpath, dirname, normpath, pardir
 from pathlib import Path
-from re import Pattern, fullmatch
+from re import Pattern, compile, fullmatch
 from shutil import rmtree
 from tempfile import TemporaryDirectory
 from types import TracebackType
@@ -129,7 +130,6 @@ class GitHubRepository:
         return None
 
 
-# TODO: should this extend BadZipFile?  Probably not once other formats work.
 class SecurityException(Exception):
     """Exception raised for attepts to breach security."""
 
@@ -183,6 +183,20 @@ def merge_manifest(manifest: set[Path], destination: set[Path]) -> None:
     destination |= manifest
 
 
+# equivalent to 0o777
+_POSIX_PERMISSIONS_MASK: int = (
+    stat.S_IRUSR
+    | stat.S_IWUSR
+    | stat.S_IXUSR
+    | stat.S_IRGRP
+    | stat.S_IWGRP
+    | stat.S_IXGRP
+    | stat.S_IROTH
+    | stat.S_IWOTH
+    | stat.S_IXOTH
+)
+
+
 # TODO: symlinks?  check their targets?
 class ZipPackage:
     def __init__(self, path: Path):
@@ -195,7 +209,9 @@ class ZipPackage:
         for name in self._zip_file.namelist():
             info = self._zip_file.getinfo(name)
             is_directory = info.is_dir()
-            permissions = (info.external_attr >> 16) & 0o777
+            posix_attributes = info.external_attr >> 16
+            permissions = posix_attributes & _POSIX_PERMISSIONS_MASK
+            # is_symlink = stat.S_IFMT(posix_attributes) == stat.S_IFLNK
             # GREATLY simplifying logic by ensuring basic access for owner
             permissions |= 0o700 if is_directory else 0o600
             path = Path(normpath(name))
@@ -265,6 +281,9 @@ class ZipPackage:
         manifest: set[Path] = set()
         for entry in self._entries:
             stripped_path = Path(*entry.path.parts[strip_components:])
+            if not stripped_path.parts:
+                LOG.debug(f"Skipping stripped component: {entry.path}")
+                continue
             manifest.add(stripped_path)
             installed_path = destination / stripped_path
             with self._zip_file.open(entry.name) as entry_file:
@@ -309,11 +328,11 @@ class ArchiveFormat(Enum):
     TAR = auto()
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Asset:
     pattern: Pattern[str]
-    destination: Path
     archive_format: ArchiveFormat | None  # no default; explicit is clearer
+    destination: Path = Path(".")
     strip_archive_components: int = 0
     rename_file: str = ""
 
@@ -325,7 +344,7 @@ class Asset:
             )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ApplicationUpdater:
     repository: GitHubRepository
     assets: list[Asset]
@@ -358,10 +377,6 @@ class ApplicationUpdater:
                     " strip_archive_components was specified."
                 )
 
-    # TODO: add option to delete things in destination that aren't in the
-    # full_manifest or user_data (maybe rename that to "keep"?)
-    # Maybe remove in_place and make it always True?  Ensure install_directory
-    # exists too?
     def update(
         self,
         install_directory: Path,
@@ -441,10 +456,11 @@ class ApplicationUpdater:
             LOG.debug("Processing preserved paths...")
             for path in self.preserved_paths:
                 preserved_path = install_directory / path
-                target_path = staging_directory / path
-                delete_path(target_path)
-                preserved_path.rename(target_path)
-                merge_manifest({target_path}, destination=full_manifest)
+                if preserved_path.exists():
+                    target_path = staging_directory / path
+                    delete_path(target_path)
+                    preserved_path.rename(target_path)
+                    merge_manifest({target_path}, destination=full_manifest)
             LOG.debug("Deleting old installation...")
             delete_path(install_directory)
             LOG.debug("Moving staging to the install directory...")
@@ -455,11 +471,32 @@ class ApplicationUpdater:
 
 def main() -> int:
     setup_logging(log_path="foo.txt", console_level=logging.DEBUG)
-    # repository = GitHubRepository("Peacock", organization="thepeacockproject")
+    peacock_updater = ApplicationUpdater(
+        repository=GitHubRepository(
+            "Peacock", organization="thepeacockproject"
+        ),
+        assets=[
+            Asset(
+                pattern=compile(r"Peacock-v[^-]+\.zip"),
+                archive_format=ArchiveFormat.ZIP,
+                # destination=Path("."),
+                strip_archive_components=1,
+            )
+        ],
+        preserved_paths={
+            Path("userdata"),
+            Path("contracts"),
+            Path("contractSessions"),
+        },
+    )
+    peacock_updater.update(Path("/tmp/test/Peacock"))
+
     # release = repository.get_release()
     # if release:
     #    print(f"Release Tag: {release.tag}")
-    #    asset = release.single_matching_asset(re.compile(r"Peacock-v[^-]+\.zip"))
+    #    asset = release.single_matching_asset(
+    #        re.compile(r"Peacock-v[^-]+\.zip")
+    # )
     #    if asset:
     #        print(f"Asset: {asset}")
     #        urllib.request.urlretrieve(release.asset_urls[asset], asset)
