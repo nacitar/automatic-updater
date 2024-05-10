@@ -3,15 +3,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import urllib.request
 from contextlib import ExitStack
-from dataclasses import KW_ONLY, dataclass, field
+from dataclasses import KW_ONLY, dataclass, field, replace
 from enum import Enum, auto, unique
+from os.path import commonpath, dirname, normpath, pardir
 from pathlib import Path
 from re import Pattern, fullmatch
+from shutil import rmtree
+from stat import S_IMODE
 from tempfile import TemporaryDirectory
-from typing import ClassVar, Iterable, Optional
+from types import TracebackType
+from typing import ClassVar, Iterable, Optional, Type
 from urllib.error import HTTPError
 from zipfile import ZipFile, ZipInfo
 
@@ -127,6 +130,7 @@ class GitHubRepository:
         return None
 
 
+# TODO: should this extend BadZipFile?  Probably not once other formats work.
 class SecurityException(Exception):
     """Exception raised for attepts to breach security."""
 
@@ -145,57 +149,153 @@ class EntryMetadata:
         )
 
 
-# TODO: detect and check symlink paths
-def extract_zip(
-    archive: str | Path, *, destination: str | Path, strip_components: int = 0
-) -> dict[Path, EntryMetadata]:
-    destination = Path(destination).absolute()
-    manifest: dict[Path, EntryMetadata] = {}
-    with ZipFile(archive, "r") as zip_file:
-        # all names shortest to longest... which for a given subtree is
-        # effectively shallowest to deepest.
-        max_strip = len(Path(os.path.commonpath(zip_file.namelist())).parts)
-        if strip_components > max_strip:
-            raise ValueError(
-                f"Archive only has {max_strip} common root component(s), but"
-                f" {strip_components} component(s) were requested to be"
-                " stripped."
+@dataclass(frozen=True)
+class PathMetadata:
+    permissions: int
+    is_directory: bool
+
+
+@dataclass(frozen=True)
+class ZipEntry:
+    name: str
+    path: Path
+    metadata: PathMetadata
+
+
+# TODO: symlinks?  check their targets?
+class ZipPackage:
+    def __init__(self, path: Path):
+        self.path = path.absolute()
+        self.__error_prefix = f'Zip archive "{self.path}"'
+        self._zip_file = ZipFile(self.path, "r")
+        common_root: str | None = None
+        entries: list[ZipEntry] = []
+        processed_paths: set[Path] = set()
+        for name in self._zip_file.namelist():
+            info = self._zip_file.getinfo(name)
+            is_directory = info.is_dir()
+            permissions = (info.external_attr >> 16) & 0o777
+            # GREATLY simplifying logic by ensuring basic access for owner
+            permissions |= 0o700 if is_directory else 0o600
+            path = Path(normpath(name))
+            if path in processed_paths:
+                raise AssertionError(
+                    f"{self.__error_prefix} has more than one entry that"
+                    f" refers to the same path: {path}"
+                )
+            processed_paths.add(path)
+            if path.is_absolute():
+                raise SecurityException(
+                    f"{self.__error_prefix} has entry with an absolute"
+                    f" path: {path}"
+                )
+            if pardir in path.parts:
+                raise SecurityException(
+                    f"{self.__error_prefix} has maliciously crafted entry"
+                    f' attempting the "Zip Slip" vulnerability: {path}'
+                )
+            if common_root is None:
+                common_root = str(path)
+                if not is_directory:
+                    # using dirname instead of Path.parent because if there's
+                    # no parent it gives "" instead of "."
+                    common_root = dirname(str(path))
+            else:
+                common_root = commonpath([common_root, str(path)])
+
+            entries.append(
+                ZipEntry(
+                    name=name,
+                    path=path,
+                    metadata=PathMetadata(
+                        permissions=(info.external_attr >> 16) & 0o777,
+                        is_directory=is_directory,
+                    ),
+                )
             )
-        for name in sorted(zip_file.namelist(), key=len):
-            entry = Path(name)
-            if entry.is_absolute():
-                raise SecurityException(
-                    f'Zip file "{archive}" has entry with absolute'
-                    f" path: {entry}"
-                )
-            entry = Path(*entry.parts[strip_components:])  # strip components
-            extracted_path = (destination / entry).absolute()
-            if not extracted_path.is_relative_to(destination):
-                raise SecurityException(
-                    f'Zip file "{archive}" has maliciously crafted entry'
-                    ' attempting to utilize the "Zip Slip"'
-                    f" vulnerability: {name}"
-                )
+        # for a given directory subtree, this order ensures you'll always
+        # process parent paths before child paths.
+        self._entries = sorted(
+            entries, key=lambda entry: len(entry.path.parts)
+        )
+        self._common_root = Path(common_root or "")
 
-            metadata = EntryMetadata.from_ZipInfo(zip_file.getinfo(name))
-            manifest[extracted_path] = metadata
-            temp_permissions = 0o700 if metadata.is_directory else 0o600
-            if extracted_path.exists():
-                extracted_path.chmod(temp_permissions)  # ensure modifiable
+    @property
+    def common_root(self) -> Path:
+        return Path(self._common_root)
 
-            with zip_file.open(name) as entry_file:
-                if metadata.is_directory:
-                    extracted_path.mkdir()
-                else:
-                    with open(extracted_path, "wb") as output_file:
-                        output_file.write(entry_file.read())
-            extracted_path.chmod(temp_permissions)  # ensure modifiable
-    # apply proper permissions (deepest to shallowest)
-    for path in sorted(
-        manifest.keys(), key=lambda p: len(p.parts), reverse=True
-    ):
-        path.chmod(manifest[path].mode)
-    return manifest
+    @property
+    def common_root_depth(self) -> int:
+        return len(self._common_root.parts)
+
+    def extract(
+        self,
+        destination: Path,
+        *,
+        strip_components: int = 0,
+        pretend: bool = False,
+    ) -> dict[Path, PathMetadata]:
+        if strip_components > self.common_root_depth:
+            raise ValueError(
+                f"{self.__error_prefix} only has {self.common_root_depth}"
+                f" common root component(s), but {strip_components}"
+                " component(s) were requested to be stripped."
+            )
+        destination = destination.absolute()
+        manifest: dict[Path, PathMetadata] = {}
+        for entry in self._entries:
+            entry = replace(  # new Entry with the extracted path
+                entry,
+                path=destination / Path(*entry.path.parts[strip_components:]),
+            )
+            manifest[entry.path] = entry.metadata
+            if not pretend:
+                with self._zip_file.open(entry.name) as entry_file:
+                    if entry.metadata.is_directory:
+                        if entry.path.is_dir():
+                            entry.path.chmod(entry.metadata.permissions)
+                            continue  # nothing else needed for directory
+                        if entry.path.exists():
+                            LOG.warning(
+                                f"{self.__error_prefix} extraction overwriting"
+                                f" file with directory: {entry.path}"
+                            )
+                            entry.path.unlink()
+                        entry.path.mkdir(
+                            mode=entry.metadata.permissions, parents=True
+                        )
+                    else:
+                        if entry.path.is_dir():
+                            LOG.warning(
+                                f"{self.__error_prefix} extraction overwriting"
+                                f" directory with file: {entry.path}"
+                            )
+                            rmtree(entry.path)
+                        elif entry.path.exists():
+                            # set again after extraction, but ensures writable
+                            entry.path.chmod(entry.metadata.permissions)
+                        # safety for if directories aren't distinct entries
+                        # in the zip and only files exist (non-standard)
+                        entry.path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(entry.path, "wb") as output_file:
+                            output_file.write(entry_file.read())
+                        entry.path.chmod(entry.metadata.permissions)
+        return manifest
+
+    def __enter__(self) -> ZipPackage:
+        self._zip_file.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_traceback: TracebackType | None,
+    ) -> None:
+        self._zip_file.__exit__(exc_type, exc_value, exc_traceback)
+
+    def close(self) -> None:
+        self._zip_file.close()
 
 
 @unique
@@ -253,19 +353,23 @@ class ApplicationUpdater:
                     f"Release asset {repr(name)} is not an archive, but"
                     " strip_archive_components was specified."
                 )
-
+    # TODO: add option to delete things in destination that aren't in the
+    # full_manifest or user_data (maybe rename that to "keep"?)
+    # Maybe remove in_place and make it always True?  Ensure install_directory
+    # exists too?
     def update(
         self, install_directory: Path, *, tag: str = "", in_place: bool = False
-    ) -> None:
+    ) -> dict[Path, PathMetadata]:
+        full_manifest: dict[Path, PathMetadata] = {}
         tag_file = install_directory / ".github_release_tag"
         release = self.repository.get_release(tag=tag)
         if not release:
             LOG.info(f"No release found for: {self.repository}")
-            return
+            return full_manifest
         installed_tag = tag_file.read_text().strip()
         if tag_file.exists() and installed_tag == release.tag:
             LOG.info(f'Installed tag "{installed_tag}" is the latest.')
-            return
+            return full_manifest
         self.validate_release(release)  # ensure release has what we need
         LOG.info(f'Updating tag from "{installed_tag}" to "{release.tag}"')
         with ExitStack() as stack:
@@ -300,15 +404,15 @@ class ApplicationUpdater:
                 target_directory.mkdir(parents=True, exist_ok=True)
                 if asset.archive_format:
                     if asset.archive_format == ArchiveFormat.ZIP:
-                        # TODO: accumulate manifest, log overwrites
                         LOG.debug(
                             f"Extracting {target_file} to:"
                             f" {staging_destination}"
                         )
-                        extract_zip(
-                            target_file,
-                            destination=staging_destination,
+                        package = ZipPackage(target_file)
+                        manifest = package.extract(
+                            staging_destination,
                             strip_components=asset.strip_archive_components,
+                            # pretend=true,
                         )
                         target_file.unlink()
                     else:
@@ -316,15 +420,26 @@ class ApplicationUpdater:
                             f"Archive type {asset.archive_format}"
                         )
                 else:
-                    # TODO: add file to manifest
-                    LOG.debug("TODO")
+                    manifest = {
+                        target_file: PathMetadata(
+                            is_directory=False,
+                            permissions=S_IMODE(target_file.stat().st_mode),
+                        )
+                    }
+                overlap = full_manifest.keys() & manifest.keys()
+                for path in overlap:
+                    LOG.warning(
+                        f"When processing {target_file}, path {path} was"
+                        " already installed by an earlier package but has now"
+                        " been overwritten."
+                    )
+                full_manifest |= manifest
             if not in_place:
                 # TODO: move it to the destination!
                 LOG.error("UNIMPLEMENTED: move build when not in_place")
-            # TODO: install, write out tag_file
-
-
-# def make_pristine(path: str|Path, manifest: dict[Path, EntryMetadata])
+            tag_file.write_text(release.tag)
+        # NOTE: outside with
+        return full_manifest
 
 
 def main() -> int:
