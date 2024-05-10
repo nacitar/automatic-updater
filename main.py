@@ -5,13 +5,12 @@ import json
 import logging
 import urllib.request
 from contextlib import ExitStack
-from dataclasses import KW_ONLY, dataclass, field, replace
+from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum, auto, unique
 from os.path import commonpath, dirname, normpath, pardir
 from pathlib import Path
 from re import Pattern, fullmatch
 from shutil import rmtree
-from stat import S_IMODE
 from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import ClassVar, Iterable, Optional, Type
@@ -162,10 +161,32 @@ class ZipEntry:
     metadata: PathMetadata
 
 
+def delete_path(path: Path) -> None:
+    if path.exists():
+        if path.is_dir():
+            LOG.warning(f"Deleting directory: {path}")
+            path.chmod(0o700)
+            rmtree(path)
+        else:
+            LOG.warning(f"Deleting file: {path}")
+            path.chmod(0o600)
+            path.unlink()
+
+
+def merge_manifest(manifest: set[Path], destination: set[Path]) -> None:
+    overlap = destination & manifest
+    for path in overlap:
+        LOG.warning(
+            f"Path {path} was already installed by an earlier package but has"
+            " been overwritten by a later one."
+        )
+    destination |= manifest
+
+
 # TODO: symlinks?  check their targets?
 class ZipPackage:
     def __init__(self, path: Path):
-        self.path = path.absolute()
+        self.path = path.resolve()
         self.__error_prefix = f'Zip archive "{self.path}"'
         self._zip_file = ZipFile(self.path, "r")
         common_root: str | None = None
@@ -233,53 +254,36 @@ class ZipPackage:
         destination: Path,
         *,
         strip_components: int = 0,
-        pretend: bool = False,
-    ) -> dict[Path, PathMetadata]:
+    ) -> set[Path]:
         if strip_components > self.common_root_depth:
             raise ValueError(
                 f"{self.__error_prefix} only has {self.common_root_depth}"
                 f" common root component(s), but {strip_components}"
                 " component(s) were requested to be stripped."
             )
-        destination = destination.absolute()
-        manifest: dict[Path, PathMetadata] = {}
+        destination = destination.resolve()
+        manifest: set[Path] = set()
         for entry in self._entries:
-            entry = replace(  # new Entry with the extracted path
-                entry,
-                path=destination / Path(*entry.path.parts[strip_components:]),
-            )
-            manifest[entry.path] = entry.metadata
-            if not pretend:
-                with self._zip_file.open(entry.name) as entry_file:
-                    if entry.metadata.is_directory:
-                        if entry.path.is_dir():
-                            entry.path.chmod(entry.metadata.permissions)
-                            continue  # nothing else needed for directory
-                        if entry.path.exists():
-                            LOG.warning(
-                                f"{self.__error_prefix} extraction overwriting"
-                                f" file with directory: {entry.path}"
-                            )
-                            entry.path.unlink()
-                        entry.path.mkdir(
-                            mode=entry.metadata.permissions, parents=True
-                        )
-                    else:
-                        if entry.path.is_dir():
-                            LOG.warning(
-                                f"{self.__error_prefix} extraction overwriting"
-                                f" directory with file: {entry.path}"
-                            )
-                            rmtree(entry.path)
-                        elif entry.path.exists():
-                            # set again after extraction, but ensures writable
-                            entry.path.chmod(entry.metadata.permissions)
-                        # safety for if directories aren't distinct entries
-                        # in the zip and only files exist (non-standard)
-                        entry.path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(entry.path, "wb") as output_file:
-                            output_file.write(entry_file.read())
-                        entry.path.chmod(entry.metadata.permissions)
+            stripped_path = Path(*entry.path.parts[strip_components:])
+            manifest.add(stripped_path)
+            installed_path = destination / stripped_path
+            with self._zip_file.open(entry.name) as entry_file:
+                if installed_path.exists():
+                    LOG.warning(
+                        f"Removing already existing path: {installed_path}"
+                    )
+                    delete_path(installed_path)
+                if entry.metadata.is_directory:
+                    installed_path.mkdir(
+                        mode=entry.metadata.permissions, parents=True
+                    )
+                else:
+                    # safety for if directories aren't distinct entries
+                    # in the zip and only files exist (non-standard)
+                    installed_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(installed_path, "wb") as output_file:
+                        output_file.write(entry_file.read())
+                    installed_path.chmod(entry.metadata.permissions)
         return manifest
 
     def __enter__(self) -> ZipPackage:
@@ -325,12 +329,12 @@ class Asset:
 class ApplicationUpdater:
     repository: GitHubRepository
     assets: list[Asset]
-    user_data: set[Path]
+    preserved_paths: set[Path]
     # background_processes: list[list[str]]
     # main_process: list[str]
 
     def __post_init__(self) -> None:
-        for path in self.user_data:
+        for path in self.preserved_paths:
             if path.is_absolute():
                 raise ValueError(f"User data path is an absolute path: {path}")
 
@@ -353,33 +357,45 @@ class ApplicationUpdater:
                     f"Release asset {repr(name)} is not an archive, but"
                     " strip_archive_components was specified."
                 )
+
     # TODO: add option to delete things in destination that aren't in the
     # full_manifest or user_data (maybe rename that to "keep"?)
     # Maybe remove in_place and make it always True?  Ensure install_directory
     # exists too?
     def update(
-        self, install_directory: Path, *, tag: str = "", in_place: bool = False
-    ) -> dict[Path, PathMetadata]:
-        full_manifest: dict[Path, PathMetadata] = {}
+        self,
+        install_directory: Path,
+        *,
+        tag: str = "",
+        staging_directory: Path | None = None,
+    ) -> None:
+        install_directory = install_directory.resolve()
+        if staging_directory:
+            staging_directory = staging_directory.resolve()
+            if staging_directory == install_directory:
+                raise ValueError(
+                    "staging_directory refers to the same path as"
+                    f" install_directory: {staging_directory}"
+                )
         tag_file = install_directory / ".github_release_tag"
         release = self.repository.get_release(tag=tag)
         if not release:
             LOG.info(f"No release found for: {self.repository}")
-            return full_manifest
-        installed_tag = tag_file.read_text().strip()
-        if tag_file.exists() and installed_tag == release.tag:
+            return
+        installed_tag = (
+            tag_file.read_text().strip() if tag_file.exists() else ""
+        )
+        if installed_tag == release.tag:
             LOG.info(f'Installed tag "{installed_tag}" is the latest.')
-            return full_manifest
+            return
         self.validate_release(release)  # ensure release has what we need
         LOG.info(f'Updating tag from "{installed_tag}" to "{release.tag}"')
+        full_manifest: set[Path] = set()
         with ExitStack() as stack:
             asset_directory = Path(stack.enter_context(TemporaryDirectory()))
-            if in_place:
-                staging_directory = install_directory
-            else:
-                staging_directory = Path(
-                    stack.enter_context(TemporaryDirectory())
-                )
+            staging_directory = Path(
+                stack.enter_context(TemporaryDirectory(dir=staging_directory))
+            )
             LOG.debug(f"Downloading assets into: {asset_directory}")
             LOG.debug(f"Staging into: {staging_directory}")
             for asset in self.assets:
@@ -412,7 +428,6 @@ class ApplicationUpdater:
                         manifest = package.extract(
                             staging_destination,
                             strip_components=asset.strip_archive_components,
-                            # pretend=true,
                         )
                         target_file.unlink()
                     else:
@@ -420,26 +435,22 @@ class ApplicationUpdater:
                             f"Archive type {asset.archive_format}"
                         )
                 else:
-                    manifest = {
-                        target_file: PathMetadata(
-                            is_directory=False,
-                            permissions=S_IMODE(target_file.stat().st_mode),
-                        )
-                    }
-                overlap = full_manifest.keys() & manifest.keys()
-                for path in overlap:
-                    LOG.warning(
-                        f"When processing {target_file}, path {path} was"
-                        " already installed by an earlier package but has now"
-                        " been overwritten."
-                    )
-                full_manifest |= manifest
-            if not in_place:
-                # TODO: move it to the destination!
-                LOG.error("UNIMPLEMENTED: move build when not in_place")
+                    manifest = {target_file}
+                merge_manifest(manifest, destination=full_manifest)
+
+            LOG.debug("Processing preserved paths...")
+            for path in self.preserved_paths:
+                preserved_path = install_directory / path
+                target_path = staging_directory / path
+                delete_path(target_path)
+                preserved_path.rename(target_path)
+                merge_manifest({target_path}, destination=full_manifest)
+            LOG.debug("Deleting old installation...")
+            delete_path(install_directory)
+            LOG.debug("Moving staging to the install directory...")
+            staging_directory.rename(install_directory)
             tag_file.write_text(release.tag)
-        # NOTE: outside with
-        return full_manifest
+        LOG.debug(f"Successfully updated to release: {release.tag}")
 
 
 def main() -> int:
