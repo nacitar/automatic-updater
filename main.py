@@ -167,7 +167,6 @@ class Metadata:
 @dataclass(frozen=True)
 class ZipEntry:
     name: str
-    path: Path
     metadata: Metadata
 
 
@@ -201,15 +200,13 @@ def print_manifest(manifest: dict[Path, Metadata]) -> None:
         print(f"{metadata.permissions:03o} {path}{suffix}")
 
 
-# TODO: make entries dict[Path, ZipEntry], remove 'path' from ZipEntry
-# add accessor to return a copy so the user can see the entries
 class ZipPackage:
     def __init__(self, path: Path):
         self.path = path.resolve()
         self.__error_prefix = f'Zip archive "{self.path}"'
         self._zip_file = ZipFile(self.path, "r")
         common_root: str | None = None
-        entries: list[ZipEntry] = []
+        entries: dict[Path, ZipEntry] = {}
         processed_paths: set[Path] = set()
         for name in self._zip_file.namelist():
             info = self._zip_file.getinfo(name)
@@ -251,22 +248,21 @@ class ZipPackage:
             else:
                 common_root = commonpath([common_root, str(path)])
 
-            entries.append(
-                ZipEntry(
-                    name=name,
-                    path=path,
-                    metadata=Metadata(
-                        permissions=(
-                            (info.external_attr >> 16)
-                            & _POSIX_PERMISSIONS_MASK
-                        ),
-                        is_directory=is_directory,
+            entries[path] = ZipEntry(
+                name=name,
+                metadata=Metadata(
+                    permissions=(
+                        (info.external_attr >> 16) & _POSIX_PERMISSIONS_MASK
                     ),
-                )
+                    is_directory=is_directory,
+                ),
             )
         # sorted so parents will come before their children
-        self._entries = sorted(entries, key=lambda entry: entry.path)
+        self._entries = dict(sorted(entries.items(), key=lambda item: item[0]))
         self._common_root = Path(common_root or "")
+
+    def entries(self) -> dict[Path, ZipEntry]:
+        return dict(self._entries)
 
     @property
     def common_root(self) -> Path:
@@ -290,10 +286,10 @@ class ZipPackage:
             )
         destination = destination.resolve()
         manifest: dict[Path, Metadata] = {}
-        for entry in self._entries:
-            stripped_path = Path(*entry.path.parts[strip_components:])
+        for path, entry in self._entries.items():
+            stripped_path = Path(*path.parts[strip_components:])
             if not stripped_path.parts:
-                LOG.debug(f"Skipping stripped component: {entry.path}")
+                LOG.debug(f"Skipping stripped component: {path}")
                 continue
             manifest[stripped_path] = entry.metadata
             installed_path = destination / stripped_path
