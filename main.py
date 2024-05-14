@@ -5,9 +5,10 @@ import json
 import logging
 import stat
 import urllib.request
-from contextlib import ExitStack
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum, auto, unique
+from itertools import chain
+from os import sep
 from os.path import commonpath, dirname, normpath, pardir
 from pathlib import Path
 from re import Pattern, compile, fullmatch
@@ -16,7 +17,7 @@ from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import ClassVar, Iterable, Optional, Type
 from urllib.error import HTTPError
-from zipfile import ZipFile, ZipInfo
+from zipfile import ZipFile
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.DEBUG)
@@ -136,29 +137,38 @@ class SecurityException(Exception):
     pass
 
 
-@dataclass
-class EntryMetadata:
-    mode: int
-    is_directory: bool
-
-    @staticmethod
-    def from_ZipInfo(info: ZipInfo) -> EntryMetadata:
-        return EntryMetadata(
-            mode=(info.external_attr >> 16) & 0o777, is_directory=info.is_dir()
-        )
+# equivalent to 0o777; like stat.S_IMODE but without the "special" bits
+_POSIX_PERMISSIONS_MASK: int = (
+    stat.S_IRUSR
+    | stat.S_IWUSR
+    | stat.S_IXUSR
+    | stat.S_IRGRP
+    | stat.S_IWGRP
+    | stat.S_IXGRP
+    | stat.S_IROTH
+    | stat.S_IWOTH
+    | stat.S_IXOTH
+)
 
 
 @dataclass(frozen=True)
-class PathMetadata:
+class Metadata:
     permissions: int
     is_directory: bool
+
+    @staticmethod
+    def from_path(path: Path) -> Metadata:
+        return Metadata(
+            permissions=path.stat().st_mode & _POSIX_PERMISSIONS_MASK,
+            is_directory=path.is_dir(),
+        )
 
 
 @dataclass(frozen=True)
 class ZipEntry:
     name: str
     path: Path
-    metadata: PathMetadata
+    metadata: Metadata
 
 
 def delete_path(path: Path) -> None:
@@ -173,8 +183,10 @@ def delete_path(path: Path) -> None:
             path.unlink()
 
 
-def merge_manifest(manifest: set[Path], destination: set[Path]) -> None:
-    overlap = destination & manifest
+def merge_manifest(
+    manifest: dict[Path, Metadata], destination: dict[Path, Metadata]
+) -> None:
+    overlap = destination.keys() & manifest.keys()
     for path in overlap:
         LOG.warning(
             f"Path {path} was already installed by an earlier package but has"
@@ -183,21 +195,14 @@ def merge_manifest(manifest: set[Path], destination: set[Path]) -> None:
     destination |= manifest
 
 
-# equivalent to 0o777
-_POSIX_PERMISSIONS_MASK: int = (
-    stat.S_IRUSR
-    | stat.S_IWUSR
-    | stat.S_IXUSR
-    | stat.S_IRGRP
-    | stat.S_IWGRP
-    | stat.S_IXGRP
-    | stat.S_IROTH
-    | stat.S_IWOTH
-    | stat.S_IXOTH
-)
+def print_manifest(manifest: dict[Path, Metadata]) -> None:
+    for path, metadata in manifest.items():
+        suffix = sep if metadata.is_directory else ""
+        print(f"{metadata.permissions:03o} {path}{suffix}")
 
 
-# TODO: symlinks?  check their targets?
+# TODO: make entries dict[Path, ZipEntry], remove 'path' from ZipEntry
+# add accessor to return a copy so the user can see the entries
 class ZipPackage:
     def __init__(self, path: Path):
         self.path = path.resolve()
@@ -211,7 +216,13 @@ class ZipPackage:
             is_directory = info.is_dir()
             posix_attributes = info.external_attr >> 16
             permissions = posix_attributes & _POSIX_PERMISSIONS_MASK
-            # is_symlink = stat.S_IFMT(posix_attributes) == stat.S_IFLNK
+            if stat.S_IFMT(posix_attributes) == stat.S_IFLNK:
+                raise ValueError(
+                    f"{self.__error_prefix} has entry that is a symlink but"
+                    " due to complexity with windows support in addition to"
+                    " the fact that symlinks can point to other symlinks, they"
+                    f" are explicitly not supported: {path}"
+                )
             # GREATLY simplifying logic by ensuring basic access for owner
             permissions |= 0o700 if is_directory else 0o600
             path = Path(normpath(name))
@@ -244,17 +255,17 @@ class ZipPackage:
                 ZipEntry(
                     name=name,
                     path=path,
-                    metadata=PathMetadata(
-                        permissions=(info.external_attr >> 16) & 0o777,
+                    metadata=Metadata(
+                        permissions=(
+                            (info.external_attr >> 16)
+                            & _POSIX_PERMISSIONS_MASK
+                        ),
                         is_directory=is_directory,
                     ),
                 )
             )
-        # for a given directory subtree, this order ensures you'll always
-        # process parent paths before child paths.
-        self._entries = sorted(
-            entries, key=lambda entry: len(entry.path.parts)
-        )
+        # sorted so parents will come before their children
+        self._entries = sorted(entries, key=lambda entry: entry.path)
         self._common_root = Path(common_root or "")
 
     @property
@@ -270,7 +281,7 @@ class ZipPackage:
         destination: Path,
         *,
         strip_components: int = 0,
-    ) -> set[Path]:
+    ) -> dict[Path, Metadata]:
         if strip_components > self.common_root_depth:
             raise ValueError(
                 f"{self.__error_prefix} only has {self.common_root_depth}"
@@ -278,13 +289,13 @@ class ZipPackage:
                 " component(s) were requested to be stripped."
             )
         destination = destination.resolve()
-        manifest: set[Path] = set()
+        manifest: dict[Path, Metadata] = {}
         for entry in self._entries:
             stripped_path = Path(*entry.path.parts[strip_components:])
             if not stripped_path.parts:
                 LOG.debug(f"Skipping stripped component: {entry.path}")
                 continue
-            manifest.add(stripped_path)
+            manifest[stripped_path] = entry.metadata
             installed_path = destination / stripped_path
             with self._zip_file.open(entry.name) as entry_file:
                 if installed_path.exists():
@@ -349,6 +360,8 @@ class ApplicationUpdater:
     repository: GitHubRepository
     assets: list[Asset]
     preserved_paths: set[Path]
+
+    TAG_FILE_NAME: ClassVar[str] = ".github_release_tag"
     # background_processes: list[list[str]]
     # main_process: list[str]
 
@@ -383,7 +396,7 @@ class ApplicationUpdater:
         *,
         tag: str = "",
         staging_directory: Path | None = None,
-    ) -> None:
+    ) -> dict[Path, Metadata]:
         install_directory = install_directory.resolve()
         if staging_directory:
             staging_directory = staging_directory.resolve()
@@ -392,27 +405,28 @@ class ApplicationUpdater:
                     "staging_directory refers to the same path as"
                     f" install_directory: {staging_directory}"
                 )
-        tag_file = install_directory / ".github_release_tag"
+        tag_file = install_directory / type(self).TAG_FILE_NAME
         release = self.repository.get_release(tag=tag)
         if not release:
             LOG.info(f"No release found for: {self.repository}")
-            return
+            return {}
         installed_tag = (
             tag_file.read_text().strip() if tag_file.exists() else ""
         )
         if installed_tag == release.tag:
             LOG.info(f'Installed tag "{installed_tag}" is the latest.')
-            return
+            return {}
         self.validate_release(release)  # ensure release has what we need
         LOG.info(f'Updating tag from "{installed_tag}" to "{release.tag}"')
-        full_manifest: set[Path] = set()
-        with ExitStack() as stack:
-            asset_directory = Path(stack.enter_context(TemporaryDirectory()))
-            staging_directory = Path(
-                stack.enter_context(TemporaryDirectory(dir=staging_directory))
-            )
+        full_manifest: dict[Path, Metadata] = {}
+        with TemporaryDirectory() as str_asset_directory, TemporaryDirectory(
+            dir=staging_directory
+        ) as str_staging_directory:
+            asset_directory = Path(str_asset_directory)
+            staging_directory = Path(str_staging_directory)
             LOG.debug(f"Downloading assets into: {asset_directory}")
             LOG.debug(f"Staging into: {staging_directory}")
+            asset_directory.mkdir(parents=True, exist_ok=True)
             for asset in self.assets:
                 name = release.single_matching_asset(asset.pattern)
                 if not name:
@@ -421,18 +435,15 @@ class ApplicationUpdater:
                     )
                 asset_url = release.asset_urls[name]
                 staging_destination = staging_directory / asset.destination
+                staging_destination.mkdir(parents=True, exist_ok=True)
                 if asset.archive_format:
-                    target_directory = asset_directory
-                    target_file = target_directory / name
+                    target_file = asset_directory / name
                 else:
-                    target_directory = staging_destination
-                    target_file = target_directory / (
-                        name if not asset.rename_file else asset.rename_file
+                    target_file = staging_destination / (
+                        asset.rename_file or name
                     )
                 LOG.debug(f"Downloading {asset_url} to: {target_file}")
                 urllib.request.urlretrieve(asset_url, target_file)
-
-                target_directory.mkdir(parents=True, exist_ok=True)
                 if asset.archive_format:
                     if asset.archive_format == ArchiveFormat.ZIP:
                         LOG.debug(
@@ -450,7 +461,11 @@ class ApplicationUpdater:
                             f"Archive type {asset.archive_format}"
                         )
                 else:
-                    manifest = {target_file}
+                    manifest = {
+                        target_file.relative_to(
+                            staging_directory
+                        ): Metadata.from_path(target_file)
+                    }
                 merge_manifest(manifest, destination=full_manifest)
 
             LOG.debug("Processing preserved paths...")
@@ -460,13 +475,27 @@ class ApplicationUpdater:
                     target_path = staging_directory / path
                     delete_path(target_path)
                     preserved_path.rename(target_path)
-                    merge_manifest({target_path}, destination=full_manifest)
+                    entries: Iterable[Path] = [target_path]
+                    if target_path.is_dir():
+                        entries = chain(entries, target_path.rglob("*"))
+                    manifest = {}
+                    for entry in entries:
+                        manifest[
+                            entry.relative_to(staging_directory)
+                        ] = Metadata.from_path(entry)
+                    merge_manifest(manifest, destination=full_manifest)
             LOG.debug("Deleting old installation...")
             delete_path(install_directory)
             LOG.debug("Moving staging to the install directory...")
             staging_directory.rename(install_directory)
             tag_file.write_text(release.tag)
+        # # Add the tag file to the manifest
+        # full_manifest[
+        #     tag_file.relative_to(install_directory)
+        # ] = Metadata.from_path(tag_file)
         LOG.debug(f"Successfully updated to release: {release.tag}")
+        # sorted so parents will come before their children
+        return dict(sorted(full_manifest.items(), key=lambda item: item[0]))
 
 
 def main() -> int:
@@ -489,7 +518,8 @@ def main() -> int:
             Path("contractSessions"),
         },
     )
-    peacock_updater.update(Path("/tmp/test/Peacock"))
+    manifest = peacock_updater.update(Path("/tmp/test/Peacock"))
+    print_manifest(manifest)
 
     # release = repository.get_release()
     # if release:
