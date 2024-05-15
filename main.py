@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import stat
+import subprocess
 import urllib.request
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum, auto, unique
@@ -15,7 +16,7 @@ from re import Pattern, compile, fullmatch
 from shutil import rmtree
 from tempfile import TemporaryDirectory
 from types import TracebackType
-from typing import ClassVar, Iterable, Optional, Type
+from typing import ClassVar, Iterable, Protocol, Type, runtime_checkable
 from urllib.error import HTTPError
 from zipfile import ZipFile
 
@@ -25,11 +26,11 @@ LOG.setLevel(logging.DEBUG)
 
 def setup_logging(
     *,
-    log_path: Optional[str | Path] = None,
+    log_path: Path | None = None,
     console_level: int = logging.INFO,
     file_level: int = logging.DEBUG,
     global_level: int = logging.INFO,
-    append: bool = False,
+    append: bool = True,
 ) -> None:
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
@@ -351,6 +352,29 @@ class Asset:
             )
 
 
+@runtime_checkable
+class CanStartMinimized(Protocol):
+    STARTUPINFO: type
+    STARTF_USESHOWWINDOW: int
+    SW_MINIMIZE: int
+
+
+@dataclass
+class Process:
+    command_line: list[str]
+    _ = KW_ONLY
+    start_minimized: bool = False
+
+    def start(self) -> subprocess.Popen[bytes]:
+        if self.start_minimized and isinstance(subprocess, CanStartMinimized):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_MINIMIZE
+            return subprocess.Popen(self.command_line, startupinfo=startupinfo)
+        else:
+            return subprocess.Popen(self.command_line)
+
+
 @dataclass(kw_only=True)
 class ApplicationUpdater:
     repository: GitHubRepository
@@ -358,8 +382,7 @@ class ApplicationUpdater:
     preserved_paths: set[Path]
 
     TAG_FILE_NAME: ClassVar[str] = ".github_release_tag"
-    # background_processes: list[list[str]]
-    # main_process: list[str]
+    processes: list[Process]
 
     def __post_init__(self) -> None:
         for path in self.preserved_paths:
@@ -493,9 +516,21 @@ class ApplicationUpdater:
         # sorted so parents will come before their children
         return dict(sorted(full_manifest.items(), key=lambda item: item[0]))
 
+    def launch(self) -> None:
+        child_processes: list[subprocess.Popen[bytes]]
+        for process in self.processes:
+            LOG.info(f"Starting subprocess: {process.command_line}")
+            child_processes.append(process.start())
 
+        LOG.info("Waiting for all subprocesses to exit...")
+        for child in child_processes:
+            child.wait()
+
+
+# TODO: make this into an installable package, move main into game specific
+# scripts such as hitman_peacock.py, test on windows.  Update log_path.
 def main() -> int:
-    setup_logging(log_path="foo.txt", console_level=logging.DEBUG)
+    setup_logging(log_path=Path("foo.txt"), console_level=logging.DEBUG)
     peacock_updater = ApplicationUpdater(
         repository=GitHubRepository(
             "Peacock", organization="thepeacockproject"
@@ -513,22 +548,13 @@ def main() -> int:
             Path("contracts"),
             Path("contractSessions"),
         },
+        processes=[
+            Process(["Start Server.cmd"], start_minimized=True),
+            Process(["PeacockPatcher.exe"], start_minimized=True),
+        ],
     )
     manifest = peacock_updater.update(Path("/tmp/test/Peacock"))
     print_manifest(manifest)
-
-    # release = repository.get_release()
-    # if release:
-    #    print(f"Release Tag: {release.tag}")
-    #    asset = release.single_matching_asset(
-    #        re.compile(r"Peacock-v[^-]+\.zip")
-    # )
-    #    if asset:
-    #        print(f"Asset: {asset}")
-    #        urllib.request.urlretrieve(release.asset_urls[asset], asset)
-    #        extract_zip(asset, destination="output/", strip=1)
-    # else:
-    #    print("Failed to fetch release.")
     return 0
 
 
