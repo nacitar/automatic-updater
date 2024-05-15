@@ -365,14 +365,26 @@ class Process:
     _ = KW_ONLY
     start_minimized: bool = False
 
-    def start(self) -> subprocess.Popen[bytes]:
+    def __post_init__(self) -> None:
+        if not self.command_line:
+            raise AssertionError("command_line must be a non-empty list.")
+        binary = self.command_line[0]
+        if Path(binary).is_absolute():
+            raise AssertionError(
+                f"command_line binary has an absolute path: {binary}"
+            )
+
+    def start(self, install_directory: Path) -> subprocess.Popen[bytes]:
+        command_line = list(self.command_line)
+        command_line[0] = str(install_directory / command_line[0])
+        LOG.info(f"Starting subprocess: {command_line}")
         if self.start_minimized and isinstance(subprocess, CanStartMinimized):
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_MINIMIZE
-            return subprocess.Popen(self.command_line, startupinfo=startupinfo)
+            return subprocess.Popen(command_line, startupinfo=startupinfo)
         else:
-            return subprocess.Popen(self.command_line)
+            return subprocess.Popen(command_line)
 
 
 @dataclass(kw_only=True)
@@ -516,15 +528,15 @@ class ApplicationUpdater:
         # sorted so parents will come before their children
         return dict(sorted(full_manifest.items(), key=lambda item: item[0]))
 
-    def launch(self) -> None:
+    def launch(self, install_directory: Path) -> None:
         child_processes: list[subprocess.Popen[bytes]]
         for process in self.processes:
-            LOG.info(f"Starting subprocess: {process.command_line}")
-            child_processes.append(process.start())
+            child_processes.append(process.start(install_directory))
 
         LOG.info("Waiting for all subprocesses to exit...")
         for child in child_processes:
             child.wait()
+        LOG.info("All subprocesses have exited.")
 
 
 # TODO: make this into an installable package, move main into game specific
