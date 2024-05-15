@@ -392,9 +392,9 @@ class ApplicationUpdater:
     repository: GitHubRepository
     assets: list[Asset]
     preserved_paths: set[Path]
+    processes: list[Process]
 
     TAG_FILE_NAME: ClassVar[str] = ".github_release_tag"
-    processes: list[Process]
 
     def __post_init__(self) -> None:
         for path in self.preserved_paths:
@@ -541,6 +541,7 @@ class ApplicationUpdater:
 
 # TODO: make this into an installable package, move main into game specific
 # scripts such as hitman_peacock.py, test on windows.  Update log_path.
+# Maybe add a subdirectory to gitignore, and have THAT be the installation dir?
 def main() -> int:
     setup_logging(log_path=Path("foo.txt"), console_level=logging.DEBUG)
     peacock_updater = ApplicationUpdater(
