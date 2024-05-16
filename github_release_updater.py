@@ -358,6 +358,7 @@ class Asset:
 @dataclass
 class Process:
     command_line: list[str]
+    in_path: bool = False
 
     def __post_init__(self) -> None:
         if not self.command_line:
@@ -369,9 +370,12 @@ class Process:
             )
 
     def start(self, install_directory: Path) -> subprocess.Popen[bytes]:
-        LOG.info(f"Starting subprocess: {self.command_line}")
+        command_line = list(self.command_line)
+        if not self.in_path:
+            command_line[0] = str(install_directory / command_line[0])
+        LOG.info(f"Starting subprocess: {command_line}")
         return subprocess.Popen(
-            self.command_line,
+            command_line,
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             cwd=install_directory,
         )
