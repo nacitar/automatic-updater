@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from re import compile
 
-from automatic_updater import (
+from github_release_updater import (
     ApplicationUpdater,
     ArchiveFormat,
     Asset,
