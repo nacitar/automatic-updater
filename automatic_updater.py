@@ -12,21 +12,22 @@ from itertools import chain
 from os import sep
 from os.path import commonpath, dirname, normpath, pardir
 from pathlib import Path
-from re import Pattern, compile, fullmatch
+from re import Pattern, fullmatch
 from shutil import rmtree
 from tempfile import TemporaryDirectory
 from types import TracebackType
-from typing import ClassVar, Iterable, Protocol, Type, runtime_checkable
+from typing import ClassVar, Iterable, Type
 from urllib.error import HTTPError
 from zipfile import ZipFile
 
+SCRIPT_DIR = Path(__file__).parent
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.DEBUG)
 
 
 def setup_logging(
-    *,
     log_path: Path | None = None,
+    *,
     console_level: int = logging.INFO,
     file_level: int = logging.DEBUG,
     global_level: int = logging.INFO,
@@ -36,6 +37,8 @@ def setup_logging(
     console_handler.setLevel(console_level)
     handlers: list[logging.Handler] = [console_handler]
     if log_path:
+        log_path = SCRIPT_DIR / "logs" / log_path  # default if relative
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         file_handler = logging.FileHandler(log_path, mode=mode)
         file_handler.setLevel(file_level)
@@ -352,18 +355,9 @@ class Asset:
             )
 
 
-@runtime_checkable
-class CanStartMinimized(Protocol):
-    STARTUPINFO: type
-    STARTF_USESHOWWINDOW: int
-    SW_MINIMIZE: int
-
-
 @dataclass
 class Process:
     command_line: list[str]
-    _ = KW_ONLY
-    start_minimized: bool = False
 
     def __post_init__(self) -> None:
         if not self.command_line:
@@ -375,26 +369,27 @@ class Process:
             )
 
     def start(self, install_directory: Path) -> subprocess.Popen[bytes]:
-        command_line = list(self.command_line)
-        command_line[0] = str(install_directory / command_line[0])
-        LOG.info(f"Starting subprocess: {command_line}")
-        if self.start_minimized and isinstance(subprocess, CanStartMinimized):
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_MINIMIZE
-            return subprocess.Popen(command_line, startupinfo=startupinfo)
-        else:
-            return subprocess.Popen(command_line)
+        LOG.info(f"Starting subprocess: {self.command_line}")
+        return subprocess.Popen(
+            self.command_line,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            cwd=install_directory,
+        )
 
 
 @dataclass(kw_only=True)
 class ApplicationUpdater:
+    name: str
     repository: GitHubRepository
     assets: list[Asset]
     preserved_paths: set[Path]
     processes: list[Process]
 
     TAG_FILE_NAME: ClassVar[str] = ".github_release_tag"
+
+    @property
+    def default_install_directory(self) -> Path:
+        return (Path(__file__).parent / "apps" / self.name).resolve()
 
     def __post_init__(self) -> None:
         for path in self.preserved_paths:
@@ -423,12 +418,14 @@ class ApplicationUpdater:
 
     def update(
         self,
-        install_directory: Path,
+        install_directory: Path | None = None,
         *,
         tag: str = "",
         staging_directory: Path | None = None,
     ) -> dict[Path, Metadata]:
-        install_directory = install_directory.resolve()
+        install_directory = (
+            install_directory or self.default_install_directory
+        ).resolve()
         if staging_directory:
             staging_directory = staging_directory.resolve()
             if staging_directory == install_directory:
@@ -481,11 +478,13 @@ class ApplicationUpdater:
                             f"Extracting {target_file} to:"
                             f" {staging_destination}"
                         )
-                        package = ZipPackage(target_file)
-                        manifest = package.extract(
-                            staging_destination,
-                            strip_components=asset.strip_archive_components,
-                        )
+                        with ZipPackage(target_file) as package:
+                            manifest = package.extract(
+                                staging_destination,
+                                strip_components=(
+                                    asset.strip_archive_components
+                                ),
+                            )
                         target_file.unlink()
                     else:
                         raise NotImplementedError(
@@ -517,6 +516,7 @@ class ApplicationUpdater:
                     merge_manifest(manifest, destination=full_manifest)
             LOG.debug("Deleting old installation...")
             delete_path(install_directory)
+            install_directory.parent.mkdir(parents=True, exist_ok=True)
             LOG.debug("Moving staging to the install directory...")
             staging_directory.rename(install_directory)
             tag_file.write_text(release.tag)
@@ -528,50 +528,17 @@ class ApplicationUpdater:
         # sorted so parents will come before their children
         return dict(sorted(full_manifest.items(), key=lambda item: item[0]))
 
-    def launch(self, install_directory: Path) -> None:
-        child_processes: list[subprocess.Popen[bytes]]
+    def launch(
+        self, install_directory: Path | None = None, *, wait: bool = False
+    ) -> None:
+        install_directory = (
+            install_directory or self.default_install_directory
+        ).resolve()
+        child_processes: list[subprocess.Popen[bytes]] = []
         for process in self.processes:
             child_processes.append(process.start(install_directory))
-
-        LOG.info("Waiting for all subprocesses to exit...")
-        for child in child_processes:
-            child.wait()
-        LOG.info("All subprocesses have exited.")
-
-
-# TODO: make this into an installable package, move main into game specific
-# scripts such as hitman_peacock.py, test on windows.  Update log_path.
-# Maybe add a subdirectory to gitignore, and have THAT be the installation dir?
-def main() -> int:
-    setup_logging(log_path=Path("foo.txt"), console_level=logging.DEBUG)
-    peacock_updater = ApplicationUpdater(
-        repository=GitHubRepository(
-            "Peacock", organization="thepeacockproject"
-        ),
-        assets=[
-            Asset(
-                pattern=compile(r"Peacock-v[^-]+\.zip"),
-                archive_format=ArchiveFormat.ZIP,
-                # destination=Path("."),
-                strip_archive_components=1,
-            )
-        ],
-        preserved_paths={
-            Path("userdata"),
-            Path("contracts"),
-            Path("contractSessions"),
-        },
-        processes=[
-            Process(["Start Server.cmd"], start_minimized=True),
-            Process(["PeacockPatcher.exe"], start_minimized=True),
-        ],
-    )
-    manifest = peacock_updater.update(Path("/tmp/test/Peacock"))
-    print_manifest(manifest)
-    return 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())
+        if wait:
+            LOG.info("Waiting for all subprocesses to exit...")
+            for child in child_processes:
+                child.wait()
+            LOG.info("All subprocesses have exited.")
